@@ -177,18 +177,41 @@ void extend(raft::resources const& handle,
   RAFT_EXPECTS(new_indices != nullptr || index->size() == 0,
                "You must pass data indices when the index is non-empty.");
 
+  size_t free_mem, total_mem;
+  double GiB = 1 << 30;
   auto new_labels = raft::make_device_vector<LabelT, IdxT>(handle, n_rows);
   raft::cluster::kmeans_balanced_params kmeans_params;
   kmeans_params.metric  = index->metric();
   auto new_vectors_view = raft::make_device_matrix_view<const T, IdxT>(new_vectors, n_rows, dim);
   auto orig_centroids_view =
     raft::make_device_matrix_view<const float, IdxT>(index->centers().data_handle(), n_lists, dim);
+  // Calculate the batch size for the input data if it's not accessible directly from the device
+  constexpr size_t kReasonableMaxBatchSize = 65536;
+  size_t max_batch_size                    = std::min<size_t>(n_rows, kReasonableMaxBatchSize);
+
+  // Predict the cluster labels for the new data, in batches if necessary
+  utils::batch_load_iterator<T> vec_batches(
+    new_vectors,
+    n_rows,
+    index->dim(),
+    max_batch_size,
+    stream,
+    rmm::mr::get_current_device_resource());  // resource::get_workspace_resource(handle));
+
+  RAFT_LOG_INFO("ivf_flat_extend, predicting cluster labels");
+
+  for (const auto& batch : vec_batches) {
+    auto batch_data_view =
+      raft::make_device_matrix_view<const T, IdxT>(batch.data(), batch.size(), index->dim());
+    auto batch_labels_view = raft::make_device_vector_view<LabelT, IdxT>(
+      new_labels.data_handle() + batch.offset(), batch.size());
   raft::cluster::kmeans_balanced::predict(handle,
                                           kmeans_params,
-                                          new_vectors_view,
+                                            batch_data_view,
                                           orig_centroids_view,
-                                          new_labels.view(),
+                                            batch_labels_view,
                                           utils::mapping<float>{});
+  }
 
   auto* list_sizes_ptr    = index->list_sizes().data_handle();
   auto old_list_sizes_dev = raft::make_device_vector<uint32_t, IdxT>(handle, n_lists);
@@ -221,9 +244,13 @@ void extend(raft::resources const& handle,
       list_sizes_ptr, list_sizes_ptr, old_list_sizes_dev.data_handle(), n_lists, stream);
   }
 
+  RAFT_CUDA_TRY(cudaMemGetInfo(&free_mem, &total_mem));
+  RAFT_LOG_INFO("ivf_flat::build allocated mem %6.1f GiB after predicting class labels",
+                (total_mem - free_mem) / GiB);
   // Calculate and allocate new list data
   std::vector<uint32_t> new_list_sizes(n_lists);
   std::vector<uint32_t> old_list_sizes(n_lists);
+  size_t prev_free_mem = free_mem;
   {
     copy(old_list_sizes.data(), old_list_sizes_dev.data_handle(), n_lists, stream);
     copy(new_list_sizes.data(), list_sizes_ptr, n_lists, stream);
@@ -235,6 +262,20 @@ void extend(raft::resources const& handle,
                        list_device_spec,
                        new_list_sizes[label],
                        Pow2<kIndexGroupSize>::roundUp(old_list_sizes[label]));
+      RAFT_CUDA_TRY(cudaMemGetInfo(&free_mem, &total_mem));
+      size_t dmem   = prev_free_mem - free_mem;
+      prev_free_mem = free_mem;
+      size_t expected_size =
+        lists[label]->data.size() * sizeof(T) + lists[label]->indices.size() * sizeof(IdxT);
+      // RAFT_LOG_INFO("%zu %zu", dmem, expected_size);
+      RAFT_LOG_INFO(
+        "alloc mem %6.1f GiB after list %d, list size %zu, exp b: %zu, act b %zu, %4.1fx",
+        (total_mem - free_mem) / GiB,
+        label,
+        static_cast<size_t>(new_list_sizes[label]),
+        expected_size,
+        dmem,
+        dmem / (float)expected_size);
     }
   }
   // Update the pointers and the sizes
@@ -243,12 +284,20 @@ void extend(raft::resources const& handle,
   // we'll rebuild the `list_sizes_ptr` in the following kernel, using it as an atomic counter.
   raft::copy(list_sizes_ptr, old_list_sizes_dev.data_handle(), n_lists, stream);
 
+  RAFT_LOG_INFO("ivf_flat::extend, adding vectors to index");
+
+  size_t next_report_offset = 0;
+  size_t d_report_offset    = n_rows / 100;
+  for (const auto& batch : vec_batches) {
+    auto batch_data_view =
+      raft::make_device_matrix_view<const T, IdxT>(batch.data(), batch.size(), index->dim());
   // Kernel to insert the new vectors
   const dim3 block_dim(256);
-  const dim3 grid_dim(raft::ceildiv<IdxT>(n_rows, block_dim.x));
-  build_index_kernel<<<grid_dim, block_dim, 0, stream>>>(new_labels.data_handle(),
-                                                         new_vectors,
-                                                         new_indices,
+    const dim3 grid_dim(raft::ceildiv<IdxT>(batch.size(), block_dim.x));
+    build_index_kernel<<<grid_dim, block_dim, 0, stream>>>(
+      new_labels.data_handle() + batch.offset(),
+      batch_data_view.data_handle(),
+      new_indices ? new_indices + batch.offset() : new_indices,
                                                          index->data_ptrs().data_handle(),
                                                          index->inds_ptrs().data_handle(),
                                                          list_sizes_ptr,
@@ -257,6 +306,18 @@ void extend(raft::resources const& handle,
                                                          index->veclen());
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 
+    if (batch.offset() > next_report_offset) {
+      float progress = batch.offset() * 100.0f / n_rows;
+      RAFT_LOG_INFO("ivf_flat::extend added vectors %zu, %6.1f%% complete",
+                    static_cast<size_t>(batch.offset()),
+                    progress);
+      next_report_offset += d_report_offset;
+    }
+    RAFT_CUDA_TRY(cudaMemGetInfo(&free_mem, &total_mem));
+    RAFT_LOG_INFO("ivf_flat::build allocated mem %6.1f GiB after %zu vectors added to index",
+                  (total_mem - free_mem) / GiB,
+                  static_cast<size_t>(batch.offset()));
+  }
   // Precompute the centers vector norms for L2Expanded distance
   if (!index->center_norms().has_value()) {
     index->allocate_center_norms(handle);
@@ -309,12 +370,19 @@ inline auto build(raft::resources const& handle,
   static_assert(std::is_same_v<T, float> || std::is_same_v<T, uint8_t> || std::is_same_v<T, int8_t>,
                 "unsupported data type");
   RAFT_EXPECTS(n_rows > 0 && dim > 0, "empty dataset");
+  size_t free_mem, total_mem;
+  double GiB = 1 << 30;
+  RAFT_CUDA_TRY(cudaMemGetInfo(&free_mem, &total_mem));
+  RAFT_LOG_INFO("ivf_flat::build allocated mem %6.1f GiB at start", (total_mem - free_mem) / GiB);
 
   index<T, IdxT> index(handle, params, dim);
   utils::memzero(index.list_sizes().data_handle(), index.list_sizes().size(), stream);
   utils::memzero(index.data_ptrs().data_handle(), index.data_ptrs().size(), stream);
   utils::memzero(index.inds_ptrs().data_handle(), index.inds_ptrs().size(), stream);
 
+  RAFT_CUDA_TRY(cudaMemGetInfo(&free_mem, &total_mem));
+  RAFT_LOG_INFO("ivf_flat::build allocated mem %6.1f GiB after initial index struct created",
+                (total_mem - free_mem) / GiB);
   // Train the kmeans clustering
   {
     auto trainset_ratio = std::max<size_t>(
@@ -335,12 +403,18 @@ inline auto build(raft::resources const& handle,
     auto centers_view = raft::make_device_matrix_view<float, IdxT>(
       index.centers().data_handle(), index.n_lists(), index.dim());
     raft::cluster::kmeans_balanced_params kmeans_params;
+    RAFT_CUDA_TRY(cudaMemGetInfo(&free_mem, &total_mem));
+    RAFT_LOG_INFO("ivf_flat::build allocated mem %6.1f GiB after trainset copied",
+                  (total_mem - free_mem) / GiB);
     kmeans_params.n_iters = params.kmeans_n_iters;
     kmeans_params.metric  = index.metric();
     raft::cluster::kmeans_balanced::fit(
       handle, kmeans_params, trainset_const_view, centers_view, utils::mapping<float>{});
   }
 
+  RAFT_CUDA_TRY(cudaMemGetInfo(&free_mem, &total_mem));
+  RAFT_LOG_INFO("ivf_flat::build allocated mem %6.1f GiB before calling extend",
+                (total_mem - free_mem) / GiB);
   // add the data if necessary
   if (params.add_data_on_build) {
     detail::extend<T, IdxT>(handle, &index, dataset, nullptr, n_rows);
