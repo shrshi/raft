@@ -71,7 +71,7 @@ class RaftIvfFlatGpu : public ANN<T> {
   AlgoProperty get_property() const override
   {
     AlgoProperty property;
-    property.dataset_memory_type      = MemoryType::Device;
+    property.dataset_memory_type      = MemoryType::HostMmap;
     property.query_memory_type        = MemoryType::Device;
     property.need_dataset_when_search = false;
     return property;
